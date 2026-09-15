@@ -15,23 +15,37 @@
 
 ## 运行
 
-需要 Python 3 和 Pillow：
+需要 Python 3（若要重新生成素材还需 Pillow）。
+
+1. 配置你自己的模型 key（任意 OpenAI 兼容端点即可）：
 
 ```bash
-pip install pillow
+cp .env.example .env
+# 编辑 .env，填入 LLM_API_KEY（以及可选的 base / model）
+```
+
+2. 加载环境变量并启动：
+
+```bash
+set -a; source .env; set +a
 python3 server.py
 # 打开 http://127.0.0.1:8777
 ```
 
 ## 配置
 
-服务端通过 OpenAI 兼容接口调用大模型。密钥**不入库**，请用环境变量提供：
+所有密钥和端点都通过**环境变量**提供，源码中不含任何密钥：
 
-```bash
-export TAL_IMAGE_API_KEY="<your-api-key>"   # 文生图 / 出题判定共用
-```
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `LLM_API_KEY` | 聊天/出题模型的 API key（必填） | — |
+| `LLM_API_BASE` | OpenAI 兼容端点 base URL | 阿里云 DashScope |
+| `LLM_MODEL` | 模型名 | `qwen-plus` |
 
-`server.py` 里的 `CHAT` 地址和 `gen_*.py` 里的 `API` 地址请按你自己的服务改。
+默认指向[阿里云 DashScope](https://help.aliyun.com/zh/model-studio/developer-reference/compatibility-of-openai-with-dashscope)，
+换成 OpenAI、DeepSeek 等任意 OpenAI 兼容服务只需改这三个变量。
+
+重新生成像素素材（可选）需额外的文生图端点，见 `.env.example` 里的 `IMAGE_API_*`。
 
 ## 目录
 

@@ -5,8 +5,8 @@ overhead (they came out empty-handed). Boulder pile grows with strain."""
 import base64, json, os, urllib.request, concurrent.futures, io
 from PIL import Image
 
-API = "http://ai-service.tal.com/openai-compatible/v1/images/generations"
-KEY = os.environ.get("TAL_IMAGE_API_KEY", "")  # set via env, never commit the real key
+API = os.environ.get("IMAGE_API_URL", "")  # OpenAI-compatible /images/generations endpoint; set via env
+KEY = os.environ.get("IMAGE_API_KEY", "")  # set via env / .env, never commit
 PROJ = "/Users/tal/Desktop/海龟汤游戏/assets"
 POOL = "/Users/tal/Desktop/资源管理"
 CHROMA = ("solid pure magenta background color hex #FF00FF, the subject fully "

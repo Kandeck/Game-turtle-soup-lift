@@ -5,9 +5,13 @@ Keeps the API key server-side, holds the LLM conversation as puzzle memory,
 and owns the authoritative game state (rounds / stones / size)."""
 import json, os, re, urllib.request, http.server, socketserver, threading
 
-CHAT = "http://ai-service.tal.com/openai-compatible/v1/chat/completions"
-KEY = os.environ.get("TAL_IMAGE_API_KEY", "")  # set via env, never commit the real key
-MODEL = "gpt-5.5"
+# OpenAI-compatible chat endpoint. Defaults to Alibaba Cloud DashScope; override
+# via env to point at any OpenAI-compatible service. No secrets in source.
+API_BASE = os.environ.get("LLM_API_BASE",
+                          "https://dashscope.aliyuncs.com/compatible-mode/v1")
+CHAT = API_BASE.rstrip("/") + "/chat/completions"
+KEY = os.environ.get("LLM_API_KEY", "")  # set via env / .env, never commit
+MODEL = os.environ.get("LLM_MODEL", "qwen-plus")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8777
 MAX_ROUND = 10
@@ -19,7 +23,8 @@ def llm(messages, temperature=None):
         payload["temperature"] = temperature
     body = json.dumps(payload).encode()
     req = urllib.request.Request(CHAT, data=body, method="POST",
-        headers={"api-key": KEY, "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {KEY}",
+                 "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
         data = json.load(r)
     return data["choices"][0]["message"]["content"]
