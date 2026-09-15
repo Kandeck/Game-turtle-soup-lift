@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Local server for the pixel-art 海龟汤 (lateral-thinking) weightlifting game.
-Keeps the API key server-side, holds the LLM conversation as puzzle memory,
-and owns the authoritative game state (rounds / stones / size)."""
-import json, os, re, urllib.request, http.server, socketserver, threading
+"""Local dev server for the pixel-art 海龟汤 (lateral-thinking) game.
 
-# OpenAI-compatible chat endpoint. Defaults to Alibaba Cloud DashScope; override
-# via env to point at any OpenAI-compatible service. No secrets in source.
+Mirrors the stateless Cloudflare Pages Functions API so the SAME index.html runs
+both locally (this server) and online (Cloudflare). The browser owns the game
+state; this backend only generates puzzles, judges questions, and seals/unseals
+the truth so it can round-trip through the client without leaking.
+
+Endpoints (all POST, JSON):
+  /api/new    {seen?}                         -> {surface, sealed}
+  /api/ask    {surface, sealed, history, question} -> {type, reply, raw, truth?}
+  /api/truth  {sealed}                        -> {truth}
+"""
+import json, os, re, hmac, hashlib, base64, secrets
+import urllib.request, http.server, socketserver
+
 API_BASE = os.environ.get("LLM_API_BASE",
                           "https://dashscope.aliyuncs.com/compatible-mode/v1")
 CHAT = API_BASE.rstrip("/") + "/chat/completions"
-KEY = os.environ.get("LLM_API_KEY", "")  # set via env / .env, never commit
+KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "qwen-plus")
+SEAL_SECRET = os.environ.get("SEAL_SECRET", "insecure-default-change-me")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8777
-MAX_ROUND = 10
-GROW_WITHIN = 5
 
-def llm(messages, temperature=None):
-    payload = {"model": MODEL, "messages": messages}
-    if temperature is not None:
-        payload["temperature"] = temperature
-    body = json.dumps(payload).encode()
+def llm(messages):
+    body = json.dumps({"model": MODEL, "messages": messages}).encode()
     req = urllib.request.Request(CHAT, data=body, method="POST",
         headers={"Authorization": f"Bearer {KEY}",
                  "Content-Type": "application/json"})
@@ -30,13 +34,40 @@ def llm(messages, temperature=None):
     return data["choices"][0]["message"]["content"]
 
 def parse_json(text):
-    t = text.strip()
+    t = (text or "").strip()
     t = re.sub(r"^```(?:json)?", "", t).strip()
     t = re.sub(r"```$", "", t).strip()
     m = re.search(r"\{.*\}", t, re.S)
     if m:
         t = m.group(0)
     return json.loads(t)
+
+# ---- truth sealing (stdlib authenticated cipher: SHA256 keystream + HMAC) ----
+# Local dev only; the Cloudflare backend uses AES-GCM. They need not interop.
+def _keystream(key, nonce, n):
+    out = bytearray()
+    ctr = 0
+    while len(out) < n:
+        out += hashlib.sha256(key + nonce + ctr.to_bytes(4, "big")).digest()
+        ctr += 1
+    return bytes(out[:n])
+
+def seal(plaintext):
+    key = hashlib.sha256(SEAL_SECRET.encode()).digest()
+    nonce = secrets.token_bytes(12)
+    pt = plaintext.encode("utf-8")
+    ct = bytes(a ^ b for a, b in zip(pt, _keystream(key, nonce, len(pt))))
+    tag = hmac.new(key, nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(nonce + tag + ct).decode()
+
+def unseal(sealed):
+    key = hashlib.sha256(SEAL_SECRET.encode()).digest()
+    raw = base64.b64decode(sealed)
+    nonce, tag, ct = raw[:12], raw[12:44], raw[44:]
+    if not hmac.compare_digest(tag, hmac.new(key, nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("bad seal")
+    pt = bytes(a ^ b for a, b in zip(ct, _keystream(key, nonce, len(ct))))
+    return pt.decode("utf-8")
 
 PUZZLE_SYS = """你是一个「海龟汤」（情境推理）游戏的出题人。
 请生成一道逻辑严密、答案唯一、可以通过一系列是非问题推理出来的海龟汤谜题。
@@ -64,118 +95,50 @@ def judge_sys(surface, truth):
 严禁给玩家任何提示或线索。
 只输出严格 JSON：{{"type":"answer|solved|offtopic","reply":"..."}}"""
 
-class Game:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.pcache_lock = threading.Lock()
-        self.next_cache = None       # (surface, truth) pre-generated in background
-        self.pregen_busy = False
-        self.seen = []               # recent surfaces, to avoid repeats
-        self.reset()
+def gen_puzzle(seen):
+    avoid = ""
+    if seen:
+        recent = "；".join(str(s)[:40] for s in seen[-6:])
+        avoid = f"\n注意：不要与最近出过的这些谜题重复或雷同：{recent}"
+    raw = llm([{"role": "system", "content": PUZZLE_SYS},
+               {"role": "user", "content": "出一道新的海龟汤谜题。" + avoid}])
+    p = parse_json(raw)
+    return p["surface"], p["truth"]
 
-    def reset(self):
-        self.size = 0
-        self.solved_count = 0
-        self.new_puzzle()
+def api_new(payload):
+    seen = payload.get("seen") or []
+    surface, truth = gen_puzzle(seen)
+    return {"surface": surface, "sealed": seal(truth)}
 
-    def _gen_puzzle(self):
-        avoid = ""
-        if self.seen:
-            recent = "；".join(s[:40] for s in self.seen[-6:])
-            avoid = f"\n注意：不要与最近出过的这些谜题重复或雷同：{recent}"
-        raw = llm([{"role": "system", "content": PUZZLE_SYS},
-                   {"role": "user", "content": "出一道新的海龟汤谜题。" + avoid}])
-        p = parse_json(raw)
-        return p["surface"], p["truth"]
+def api_ask(payload):
+    question = (payload.get("question") or "").strip()
+    surface = payload.get("surface") or ""
+    sealed = payload.get("sealed") or ""
+    history = payload.get("history") or []
+    if not question:
+        return {"error": "empty"}, 400
+    if not sealed:
+        return {"error": "missing sealed puzzle"}, 400
+    truth = unseal(sealed)
+    messages = [{"role": "system", "content": judge_sys(surface, truth)}]
+    messages += history
+    messages.append({"role": "user", "content": question})
+    raw = llm(messages)
+    try:
+        res = parse_json(raw)
+    except Exception:
+        res = {"type": "answer", "reply": raw.strip()[:200]}
+    t = res.get("type", "answer")
+    out = {"type": t, "reply": res.get("reply", ""), "raw": raw}
+    if t == "solved":
+        out["truth"] = truth
+    return out, 200
 
-    def _start_pregen(self):
-        with self.pcache_lock:
-            if self.pregen_busy or self.next_cache is not None:
-                return
-            self.pregen_busy = True
-        def work():
-            try:
-                s, t = self._gen_puzzle()
-                with self.pcache_lock:
-                    self.next_cache = (s, t)
-            except Exception:
-                pass
-            finally:
-                with self.pcache_lock:
-                    self.pregen_busy = False
-        threading.Thread(target=work, daemon=True).start()
-
-    def new_puzzle(self):
-        self.round = 0
-        self.stones = 0
-        self.status = "playing"
-        with self.pcache_lock:
-            cached = self.next_cache
-            self.next_cache = None
-        if cached:
-            self.surface, self.truth = cached
-        else:
-            self.surface, self.truth = self._gen_puzzle()
-        self.seen.append(self.surface)
-        # conversation memory for this puzzle
-        self.history = [{"role": "system",
-                         "content": judge_sys(self.surface, self.truth)}]
-        # prepare the following puzzle in the background so solving stays instant
-        self._start_pregen()
-
-    def state(self):
-        return {"round": self.round, "maxRound": MAX_ROUND,
-                "stones": self.stones, "size": self.size,
-                "solvedCount": self.solved_count, "status": self.status,
-                "surface": self.surface}
-
-    def advance(self):
-        # move to the next puzzle WITHOUT resetting size / solved count
-        with self.lock:
-            self.new_puzzle()
-            return self.state()
-
-    def ask(self, question):
-        with self.lock:
-            if self.status != "playing":
-                return {"type": "over", "reply": "本局已结束，请开始新游戏。",
-                        "state": self.state()}
-            self.history.append({"role": "user", "content": question})
-            raw = llm(self.history)
-            try:
-                res = parse_json(raw)
-            except Exception:
-                res = {"type": "answer", "reply": raw.strip()[:200]}
-            self.history.append({"role": "assistant", "content": raw})
-            t = res.get("type", "answer")
-            reply = res.get("reply", "")
-            grew = False
-            if t == "solved":
-                if self.round <= GROW_WITHIN:
-                    self.size += 1
-                    grew = True
-                self.solved_count += 1
-                out = {"type": "solved", "reply": reply, "grew": grew,
-                       "solvedRound": self.round, "truth": self.truth}
-                # do NOT advance automatically — wait for the player to press
-                # 「下一题」. Just mark solved and pre-generate the next puzzle.
-                self.status = "solved"
-                self._start_pregen()
-                out["state"] = self.state()
-                return out
-            elif t == "offtopic":
-                return {"type": "offtopic", "reply": reply, "state": self.state()}
-            else:  # answer -> costs a round + a stone
-                self.round += 1
-                self.stones += 1
-                if self.round >= MAX_ROUND:
-                    self.status = "crushed"
-                    reveal = f"{reply}\n\n💀 石头太多，角色被压倒了！汤底揭晓：{self.truth}"
-                    return {"type": "crushed", "reply": reveal,
-                            "state": self.state()}
-                return {"type": "answer", "reply": reply, "state": self.state()}
-
-GAME = Game()
+def api_truth(payload):
+    sealed = payload.get("sealed") or ""
+    if not sealed:
+        return {"error": "missing sealed puzzle"}, 400
+    return {"truth": unseal(sealed)}, 200
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **k):
@@ -194,27 +157,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
-        payload = json.loads(self.rfile.read(n) or b"{}")
+        try:
+            payload = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            payload = {}
         try:
             if self.path == "/api/new":
-                GAME.reset()
-                self._json({"reply": "新游戏开始！", "state": GAME.state()})
-            elif self.path == "/api/next":
-                self._json({"reply": "下一题！", "state": GAME.advance()})
+                self._json(api_new(payload))
             elif self.path == "/api/ask":
-                q = (payload.get("question") or "").strip()
-                if not q:
-                    self._json({"error": "empty"}, 400); return
-                self._json(GAME.ask(q))
+                obj, code = api_ask(payload)
+                self._json(obj, code)
             elif self.path == "/api/truth":
-                self._json({"truth": GAME.truth})
+                obj, code = api_truth(payload)
+                self._json(obj, code)
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
     def do_GET(self):
-        if self.path == "/" or self.path == "":
+        if self.path in ("/", ""):
             self.path = "/index.html"
         return super().do_GET()
 

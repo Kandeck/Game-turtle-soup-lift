@@ -140,6 +140,26 @@ const log = $("#log"), q = $("#q"), send = $("#send"), newg = $("#newg"),
       next = $("#next");
 let busy = false;
 
+// ---- game rules (mirrors the backend's former constants) ----
+const MAX_ROUND = 10;      // 10th stone crushes the mole
+const GROW_WITHIN = 5;     // solve within 5 rounds => size +1
+
+// ---- stateless client-side game state (the browser is the source of truth) ----
+// size / solvedCount persist across reloads via localStorage.
+const game = {
+  surface: "", sealed: "", history: [],
+  round: 0, stones: 0, status: "playing",
+  size: Number(localStorage.getItem("ts_size") || 0),
+  solvedCount: Number(localStorage.getItem("ts_solved") || 0),
+  seen: [],           // recent surfaces, sent to /api/new to avoid repeats
+};
+let prefetched = null;  // {surface, sealed} pre-fetched for instant 下一题
+
+function saveProgress(){
+  localStorage.setItem("ts_size", String(game.size));
+  localStorage.setItem("ts_solved", String(game.solvedCount));
+}
+
 function addMsg(text, cls){
   const d = document.createElement("div");
   d.className = "msg " + cls;
@@ -160,30 +180,31 @@ function strainSprite(stones){
   const n = Math.max(0, Math.min(10, stones));
   return `assets/hero${n}.png`;
 }
-function applyState(st){
-  $("#s-round").textContent = st.round;
-  $("#s-stone").textContent = st.stones;
-  $("#s-size").textContent = "Lv." + st.size;
-  $("#s-solved").textContent = st.solvedCount;
-  $("#surface").textContent = st.surface;
+// render straight from the local `game` object.
+function render(){
+  $("#s-round").textContent = game.round;
+  $("#s-stone").textContent = game.stones;
+  $("#s-size").textContent = "Lv." + game.size;
+  $("#s-solved").textContent = game.solvedCount;
+  $("#surface").textContent = game.surface;
   // health drops as stones pile on toward 10
-  const hp = Math.max(0, 100 - st.stones*10);
+  const hp = Math.max(0, 100 - game.stones*10);
   const f = $("#hpfill");
   f.style.width = hp + "%";
   f.style.background = hp>50 ? "linear-gradient(90deg,#6ee27a,#ffcf4d)"
                     : hp>20 ? "#ffcf4d" : "#ff5a5a";
   // swap the mole sprite to match strain tier (unless crushed/over)
   const hero = $("#hero");
-  if(st.status === "playing"){
-    const want = strainSprite(st.stones);
+  if(game.status === "playing"){
+    const want = strainSprite(game.stones);
     if(!hero.src.endsWith(want)) hero.src = want;
   }
   // size grows the hero; each stone makes him look more strained (crouch)
-  const grow = 1 + st.size*0.22;
-  const squash = 1 - Math.min(st.stones,10)*0.02;
+  const grow = 1 + game.size*0.22;
+  const squash = 1 - Math.min(game.stones,10)*0.02;
   hero.style.setProperty("--sz", `scale(${grow}, ${grow*squash})`);
   hero.style.transform = `scale(${grow}, ${grow*squash})`;
-  hero.style.filter = `drop-shadow(0 6px 0 rgba(0,0,0,.4)) brightness(${1-st.stones*0.04})`;
+  hero.style.filter = `drop-shadow(0 6px 0 rgba(0,0,0,.4)) brightness(${1-game.stones*0.04})`;
 }
 function crush(){
   const hero = $("#hero");
@@ -193,34 +214,56 @@ function crush(){
 
 async function ask(question){
   if(busy) return;
+  if(game.status !== "playing"){ return; }
   busy = true; send.disabled = true; q.disabled = true;
   addMsg(question, "me");
   const thinking = addMsg("……主持人思考中……", "sys");
   try{
     const r = await fetch("/api/ask", {method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({question})});
+      body: JSON.stringify({
+        surface: game.surface, sealed: game.sealed,
+        history: game.history, question,
+      })});
     const d = await r.json();
     thinking.remove();
     if(d.error){ addMsg("出错了：" + d.error, "sys"); return; }
-    const st = d.state;
+    // keep the model's conversational memory: append this turn to history
+    game.history.push({role:"user", content:question});
+    game.history.push({role:"assistant", content: d.raw ?? JSON.stringify(d)});
+
     if(d.type === "answer"){
       addMsg(d.reply, "host");
+      game.round++; game.stones++;
       const hero = $("#hero"); hero.classList.remove("shake");
       void hero.offsetWidth; hero.classList.add("shake");
-      applyState(st);
+      if(game.round >= MAX_ROUND){
+        game.status = "crushed";
+        render(); crush();
+        bubble("啊……被压扁了……");
+        addMsg("💀 石头太多，角色被压倒了！汤底揭晓：" + (d.truth || await fetchTruth()), "host bad");
+        addMsg("游戏结束。点「新局」重新开始（体型会重置）。", "sys");
+        return;
+      }
+      render();
       bubble("咕…又一块石头 😣");
     } else if(d.type === "offtopic"){
       addMsg(d.reply, "host warn");
-      applyState(st);   // round NOT consumed
+      render();   // round NOT consumed
     } else if(d.type === "solved"){
       addMsg("🎉 " + d.reply, "host good");
+      const grew = game.round <= GROW_WITHIN;
+      const solvedRound = game.round;
+      if(grew) game.size++;
+      game.solvedCount++;
+      saveProgress();
+      game.status = "solved";
       const hero = $("#hero");
       hero.src = "assets/hero0.png";   // put down the stones, celebrate
-      applyState(st);
-      if(d.grew){
-        bubble(`答对啦！${d.solvedRound}回合内解开，我变强壮了！💪`);
-        addMsg(`✨ 你在第 ${d.solvedRound} 回合内解开，角色体型 +1！`, "sys");
+      render();
+      if(grew){
+        bubble(`答对啦！${solvedRound}回合内解开，我变强壮了！💪`);
+        addMsg(`✨ 你在第 ${solvedRound} 回合内解开，角色体型 +1！`, "sys");
         hero.classList.remove("grow");
         void hero.offsetWidth; hero.classList.add("grow");
       } else {
@@ -230,13 +273,6 @@ async function ask(question){
       addMsg("点「下一题 ▶」继续挑战（体型和已解会保留）。", "sys");
       enterSolved();     // stop here, wait for player to press 下一题
       return;            // skip the finally re-enable below
-    } else if(d.type === "crushed"){
-      addMsg("💀 " + d.reply, "host bad");
-      applyState(st); crush();
-      bubble("啊……被压扁了……");
-      addMsg("游戏结束。点「新局」重新开始（体型会重置）。", "sys");
-    } else if(d.type === "over"){
-      addMsg(d.reply, "sys");
     }
   }catch(e){
     thinking.remove();
@@ -246,6 +282,16 @@ async function ask(question){
       busy = false; send.disabled = false; q.disabled = false; q.focus();
     }
   }
+}
+
+async function fetchTruth(){
+  try{
+    const r = await fetch("/api/truth", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({sealed: game.sealed})});
+    const d = await r.json();
+    return d.truth || "";
+  }catch(_){ return ""; }
 }
 
 // after a solve we pause: hide 提问, show 下一题, lock the input box.
@@ -267,16 +313,45 @@ function exitSolved(){
   q.placeholder = "输入你的问题或猜测…";
 }
 
+// fetch a fresh puzzle from /api/new (using a prefetched one if available).
+async function fetchPuzzle(){
+  if(prefetched){ const p = prefetched; prefetched = null; return p; }
+  const r = await fetch("/api/new", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({seen: game.seen.slice(-6)})});
+  const d = await r.json();
+  if(d.error) throw new Error(d.error);
+  return d;   // {surface, sealed}
+}
+// kick off background prefetch of the NEXT puzzle for instant switching.
+function startPrefetch(){
+  if(prefetched) return;
+  fetch("/api/new", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({seen: game.seen.slice(-6)})})
+    .then(r=>r.json()).then(d=>{ if(!d.error) prefetched = d; })
+    .catch(()=>{});
+}
+// load a puzzle into game state and reset the per-puzzle counters.
+function loadPuzzle(p){
+  game.surface = p.surface;
+  game.sealed = p.sealed;
+  game.history = [];
+  game.round = 0; game.stones = 0; game.status = "playing";
+  game.seen.push(p.surface);
+  $("#hero").src = "assets/hero0.png";
+  render();
+  startPrefetch();
+}
+
 async function nextPuzzle(){
   if(!solvedWaiting) return;
   next.disabled = true;
   addMsg("正在切换到下一题……", "sys");
   try{
-    const r = await fetch("/api/next", {method:"POST"});
-    const d = await r.json();
+    const p = await fetchPuzzle();   // size & solved count preserved (client state)
     log.innerHTML = "";
-    $("#hero").src = "assets/hero0.png";
-    applyState(d.state);             // size & solved count preserved by server
+    loadPuzzle(p);
     addMsg("下一题来了！仔细读汤面，开始提问吧。", "sys");
   }catch(e){
     addMsg("切换失败：" + e.message, "sys");
@@ -287,18 +362,19 @@ async function nextPuzzle(){
   busy = false; q.focus();
 }
 
-async function newGame(){
+async function newGame(resetProgress){
   if(solvedWaiting) exitSolved();   // allow restart even while awaiting 下一题
   if(busy && !solvedWaiting) return;
   busy = true; send.disabled = true; newg.disabled = true;
+  if(resetProgress){
+    game.size = 0; game.solvedCount = 0; saveProgress();
+  }
   log.innerHTML = "";
   addMsg("正在出题……", "sys");
   try{
-    const r = await fetch("/api/new", {method:"POST"});
-    const d = await r.json();
+    const p = await fetchPuzzle();
     log.innerHTML = "";
-    $("#hero").src = "assets/hero0.png";
-    applyState(d.state);
+    loadPuzzle(p);
     addMsg("新的一局开始了！仔细读汤面，开始提问吧。", "sys");
   }catch(e){
     addMsg("开局失败：" + e.message, "sys");
@@ -311,7 +387,7 @@ send.onclick = ()=>{ const v=q.value.trim(); if(v){ q.value=""; ask(v);} };
 q.addEventListener("keydown", e=>{ if(e.key==="Enter" && !q.disabled){ send.onclick(); }});
 next.onclick = nextPuzzle;
 newg.onclick = ()=>{
-  if(confirm("确定要重新开始吗？体型和已解次数都会清零。")) newGame();
+  if(confirm("确定要重新开始吗？体型和已解次数都会清零。")) newGame(true);
 };
 
 // reveal-truth modal
@@ -319,7 +395,9 @@ const reveal = $("#reveal"), modal = $("#modal");
 reveal.onclick = async ()=>{
   reveal.disabled = true;
   try{
-    const r = await fetch("/api/truth", {method:"POST"});
+    const r = await fetch("/api/truth", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({sealed: game.sealed})});
     const d = await r.json();
     $("#modaltruth").textContent = d.truth || "（暂无汤底）";
     modal.classList.add("show");
@@ -331,8 +409,8 @@ reveal.onclick = async ()=>{
 $("#modalclose").onclick = ()=> modal.classList.remove("show");
 modal.addEventListener("click", e=>{ if(e.target===modal) modal.classList.remove("show"); });
 
-// boot
-newGame();
+// boot — keep any size/solved progress saved from a previous visit
+newGame(false);
 </script>
 </body>
 </html>

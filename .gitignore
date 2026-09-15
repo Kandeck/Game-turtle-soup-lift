@@ -2,4 +2,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.dev.vars
+node_modules/
+.wrangler/
 *.log
